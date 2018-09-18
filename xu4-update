@@ -1,0 +1,269 @@
+#!/bin/bash
+
+set -o nounset
+set -o errexit
+
+REPO_URI=${REPO_URI:-"https://github.com/c0d3z3r0/odroid-xu4"}
+
+UPDATE_SELF=${UPDATE_SELF:-1}
+UPDATE_URI="https://raw.githubusercontent.com/c0d3z3r0/xu4-update/master/xu4-update"
+
+if [[ ${BOOT_PATH:-"unset"} == "unset" && ${ROOT_PATH:-"unset"} != "unset" ]] ||
+[[ ${BOOT_PATH:-"unset"} != "unset" && ${ROOT_PATH:-"unset"} == "unset" ]]; then
+	echo " *** You need to specify both ROOT_PATH and BOOT_PATH, or neither"
+	exit 1
+fi
+
+if [[ ! -e /dev/mmcblk1 && ${SD_DEV:-"unset"} == "unset" ]]; then
+	echo " *** Root device not found. You need to specify the sdcard with SD_DEV"
+	exit 1
+fi
+
+BRANCH=${BRANCH:-"master"}
+ROOT_PATH=${ROOT_PATH:-"/"}
+BOOT_PATH=${BOOT_PATH:-"/boot"}
+WORK_PATH=${WORK_PATH:-"${ROOT_PATH}/root"}
+SD_DEV=${SD_DEV:-"/dev/mmcblk1"}
+SKIP_REPODELETE=${SKIP_REPODELETE:-0}
+SKIP_BACKUP=${SKIP_BACKUP:-0}
+SKIP_DOWNLOAD=${SKIP_DOWNLOAD:-0}
+SKIP_WARNING=${SKIP_WARNING:-0}
+WANT_SYMVERS=${WANT_SYMVERS:-0}
+JUST_CHECK=${JUST_CHECK:-0}
+FW_REPO="${REPO_URI}.git"
+FW_REPOLOCAL=${FW_REPOLOCAL:-"${WORK_PATH}/.xu4-firmware"}
+FW_PATH="${BOOT_PATH}"
+FW_MODPATH="${ROOT_PATH}/lib/modules"
+FW_REV=${1:-""}
+FW_REVFILE="${FW_PATH}/.firmware_revision"
+
+function update_self() {
+	echo " *** Performing self-update"
+	_tempFileName="$0.tmp"
+
+	if ! curl -Ls --output "${_tempFileName}" "${UPDATE_URI}"; then
+		echo " !!! Failed to download update for xu4-update!"
+		echo " !!! Make sure you have ca-certificates installed and that the time is set correctly"
+		exit 1
+	fi
+
+	OCTAL_MODE=$(stat -c '%a' "$0")
+	if ! chmod ${OCTAL_MODE} "${_tempFileName}" ; then
+		echo " !!! Failed: Error while trying to set mode on ${_tempFileName}"
+		exit 1
+	fi
+
+	cat > "${WORK_PATH}/.updateScript.sh" << EOF
+	if mv "${_tempFileName}" "$0"; then
+		rm -- "\$0"
+		exec env UPDATE_SELF=0 /bin/bash "$0" "${FW_REV}"
+	else
+		echo " !!! Failed!"
+	fi
+EOF
+
+	echo " *** Relaunching after update"
+	exec /bin/bash "${WORK_PATH}/.updateScript.sh"
+}
+
+function update_modules {
+	echo " *** Updating kernel modules"
+	find "${FW_REPOLOCAL}/modules" -mindepth 1 -maxdepth 1 -type d | while read DIR; do
+		BASEDIR=$(basename "${DIR}")
+		rm -rf "${FW_MODPATH}/${BASEDIR}/kernel"
+	done
+	cp -R "${FW_REPOLOCAL}/modules/"* "${FW_MODPATH}/"
+	find "${FW_REPOLOCAL}/modules" -mindepth 1 -maxdepth 1 -type d | while read DIR; do
+		BASEDIR=$(basename "${DIR}")
+		echo " *** depmod ${BASEDIR}"
+		depmod -b "${ROOT_PATH}" -a "${BASEDIR}"
+	done
+}
+
+function show_notice {
+	local NOTICE=`curl -Lfs https://raw.githubusercontent.com/c0d3z3r0/odroid-xu4/${FW_REV}/NOTICE.md`
+	if [ -z "$NOTICE" ]; then
+		return
+	fi
+	echo "$NOTICE"
+	if ! echo "$NOTICE" | grep -q WARNING; then
+		return
+	fi
+	if [[ ${SKIP_WARNING} -ne 0 ]]; then
+		return
+	fi
+	read -p "Would you like to proceed? (y/N)" -n 1 -r -s
+	echo ""
+	if ! [[ $REPLY =~ ^[Yy]$ ]]; then
+		exit 1;
+	fi
+}
+
+function update_firmware {
+	echo " *** Updating firmware"
+	cp "${FW_REPOLOCAL}/"zImage "${FW_PATH}/"
+	if [[ -n $(shopt -s nullglob; echo "${FW_REPOLOCAL}/"*.dtb) ]]; then
+		cp "${FW_REPOLOCAL}/"*.dtb "${FW_PATH}/"
+	fi
+	if [[ -n $(shopt -s nullglob; echo "${FW_REPOLOCAL}/overlays/"*.dtb) ]]; then
+		mkdir -p "${FW_PATH}/overlays"
+		cp "${FW_REPOLOCAL}/overlays/"*.dtb "${FW_PATH}/overlays/"
+		if [[ -f "${FW_REPOLOCAL}/overlays/README" ]]; then
+			cp "${FW_REPOLOCAL}/overlays/README" "${FW_PATH}/overlays/"
+		fi
+	fi
+	if [[ ${WANT_SYMVERS} -ne 0 ]]; then
+		if [[ -f "${FW_REPOLOCAL}/Module.symvers" ]]; then
+			cp "${FW_REPOLOCAL}/Module.symvers" "${FW_PATH}/"
+		fi
+		if [[ -f "${FW_REPOLOCAL}/git_hash" ]]; then
+			cp "${FW_REPOLOCAL}/git_hash" "${FW_PATH}/"
+		fi
+	fi
+}
+
+function update_bootloader {
+	echo " *** Writing new bootloader to sd card"
+	cp -r "${FW_REPOLOCAL}"/{blobs,boot.scr,u-boot-dtb.bin} "${BOOT_PATH}"/
+	dd if="${BOOT_PATH}"/blobs/bl1.bin.hardkernel           of=${SD_DEV} seek=1   bs=$((0x200))
+	dd if="${BOOT_PATH}"/blobs/bl2.bin.hardkernel.1mb_uboot of=${SD_DEV} seek=31  bs=$((0x200))
+	dd if="${BOOT_PATH}"/u-boot-dtb.bin                     of=${SD_DEV} seek=63  bs=$((0x200))
+	dd if="${BOOT_PATH}"/blobs/tzsw.bin.hardkernel          of=${SD_DEV} seek=2111 bs=$((0x200))
+
+	# Clear env but check that we don't overwrite the first partition
+	# due to a wrong start sector value in xu4-strap (fixed in 4aa5180)
+	first_sector=$(fdisk -l ${SD_DEV} | awk "/\/dev\/${SD_DEV#/dev/}p1/ {print \$2}")
+	if [ $first_sector -ge 8192 ]; then
+		dd if=/dev/zero of=${SD_DEV} seek=6727 bs=$((0x200)) count=32
+	fi
+}
+
+function finalise {
+	if [[ -e ${ROOT_PATH}/etc ]]; then
+		echo " *** Running ldconfig"
+		ldconfig -r "${ROOT_PATH}"
+	fi
+	echo " *** Storing current firmware revision"
+	echo "${FW_REV}" > "${FW_REVFILE}"
+}
+
+function do_backup {
+	if [[ ${SKIP_BACKUP} -eq 0 ]]; then
+		echo " *** Backing up files (this will take a few minutes)"
+		if [[ -d "${FW_PATH}.bak" ]]; then
+			echo " *** Remove old firmware backup"
+			rm -rf "${FW_PATH}.bak"
+		fi
+		echo " *** Backing up firmware"
+		cp -a "${FW_PATH}" "${FW_PATH}.bak"
+		if [[ -d "${FW_MODPATH}.bak" ]]; then
+			echo " *** Remove old modules backup"
+			rm -rf "${FW_MODPATH}.bak"
+		fi
+		echo " *** Backing up modules $(uname -r)"
+		if [[ -d "${FW_MODPATH}/$(uname -r)" ]]; then
+			mkdir -p "${FW_MODPATH}.bak" && cp -a "${FW_MODPATH}/$(uname -r)" "${FW_MODPATH}.bak"
+		fi
+	fi
+}
+
+function do_update {
+	show_notice
+	download_rev
+	if [[ -f "${FW_REPOLOCAL}/pre-install" ]]; then
+		echo " *** Running pre-install script"
+		source "${FW_REPOLOCAL}/pre-install"
+	fi
+	update_firmware
+	update_modules
+	update_bootloader
+	finalise
+	if [[ -f "${FW_REPOLOCAL}/post-install" ]]; then
+		echo " *** Running post-install script"
+		source "${FW_REPOLOCAL}/post-install"
+	fi
+	remove_rev
+	echo " *** Syncing changes to disk"
+	sync
+	echo " *** If no errors appeared, your firmware was successfully updated to ${FW_REV}"
+	if [[ "${ROOT_PATH}" == "/" ]]; then
+		echo " *** A reboot is needed to activate the new firmware"
+	fi
+}
+
+function download_rev {
+	if [[ ${SKIP_DOWNLOAD} -eq 0 ]]; then
+		echo " *** Downloading specific firmware revision (this will take a few minutes)"
+		rm -rf "${FW_REPOLOCAL}"
+		mkdir -p "${FW_REPOLOCAL}"
+		curl -L "${REPO_URI}/tarball/${FW_REV}" | tar xzf - -C "${FW_REPOLOCAL}" --strip-components=1
+	fi
+}
+
+function remove_rev {
+	echo " *** Deleting downloaded files"
+	if [[ ${SKIP_REPODELETE} -eq 0 ]]; then
+		rm -rf "${FW_REPOLOCAL}"
+	fi
+}
+
+if [[ ${EUID} -ne 0 ]]; then
+	echo " !!! This tool must be run as root"
+	exit 1
+fi
+
+echo " *** Odroid-XU4 firmware updater by c0d3z3r0"
+echo " *** based on rpi-update by Hexxeh, enhanced by AndrewS and Dom"
+
+if [[ ! -d ${WORK_PATH} ]]; then
+	echo " !!! ${WORK_PATH} doesn't exist - creating"
+	mkdir -p ${WORK_PATH}
+fi
+
+if [[ ${UPDATE_SELF} -ne 0 ]]; then
+	update_self
+fi
+
+if [[ ! -d "${FW_PATH}" ]]; then
+	echo " !!! ${FW_PATH} doesn't exist - creating"
+	mkdir -p ${FW_PATH}
+fi
+
+if [[ ! -d "${FW_MODPATH}" ]]; then
+	echo " !!! ${FW_MODPATH} doesn't exist - creating"
+	mkdir -p ${FW_MODPATH}
+fi
+
+# ask github for latest version hash
+REPO_API=${REPO_URI/github.com/api.github.com\/repos}/git/refs/heads/${BRANCH}
+GITREV=$(curl -s ${REPO_API} | awk '{ if ($1 == "\"sha\":") { print substr($2, 2, 40) } }')
+FW_REV=${FW_REV:-${GITREV}}
+
+if [[ "${FW_REV}" == "" ]]; then
+	echo " *** No hash received from github: ${REPO_API}"
+	# run again with errors not suppressed
+	curl ${REPO_API}
+	exit 1
+fi
+
+if [[ ! -f "${FW_REVFILE}" ]]; then
+	echo " *** We're running for the first time"
+	if [[ ${JUST_CHECK} -ne 0 ]]; then
+		exit 2
+	fi
+	do_backup
+else
+	if [[ $(cat "${FW_REVFILE}") == "${FW_REV}" ]]; then
+		echo " *** Your firmware is already up to date"
+		exit 0
+	fi
+	if [[ ${JUST_CHECK} -ne 0 ]]; then
+		echo " *** Firmware update required. New commits available:"
+		DIFF_API=${REPO_URI/github.com/api.github.com\/repos}/compare/$(cat "${FW_REVFILE}")...${BRANCH}
+		SEPARATOR="======================================================"
+		curl -Ls ${DIFF_API} | awk -v SEPARATOR="${SEPARATOR}" -F\" ' { if ($2 == "commits") {commits=1} if (commits && $2 == "message") {print SEPARATOR "\nCommit: " $4} }' | sed 's/\\n\\n/\nCommit:\ /g'
+		exit 2
+	fi
+fi
+
+do_update
